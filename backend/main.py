@@ -4,6 +4,10 @@ import io
 import hashlib
 import math
 import os
+import logging
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
 import numpy as np
@@ -27,6 +31,10 @@ app = FastAPI(title="Renewables Forecast API", version="1.0.0")
 origins = [item.strip() for item in os.getenv("CORS_ORIGINS", "*").split(",") if item.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"], allow_headers=["*"])
 trained_cache: dict = {}
+forecast_jobs: dict = {}
+active_jobs: dict = {}
+jobs_lock = threading.Lock()
+job_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="forecast")
 
 
 class LSTMForecast(nn.Module):
@@ -92,7 +100,7 @@ def parse_csv(raw: bytes) -> tuple[pd.DataFrame, str]:
     return frame[["datetime", TARGET]], selected_source
 
 
-def fit_model(features: pd.DataFrame):
+def fit_model(features: pd.DataFrame, on_epoch=None):
     valid = features.dropna(subset=FEATURES + [TARGET]).reset_index(drop=True)
     if len(valid) < 3 * (WINDOW + 1):
         raise HTTPException(400, "Not enough rows remain after feature generation for train, validation, and test windows.")
@@ -140,7 +148,10 @@ def fit_model(features: pd.DataFrame):
                 losses.append(criterion(model(xb), yb).item())
         val_loss = float(np.mean(losses))
         scheduler.step(val_loss)
-        print(f"epoch {epoch}/250: train={train_loss / len(train_ds):.6f} val={val_loss:.6f}", flush=True)
+        epoch_train_loss = train_loss / len(train_ds)
+        print(f"epoch {epoch}/250: train={epoch_train_loss:.6f} val={val_loss:.6f}", flush=True)
+        if on_epoch:
+            on_epoch(epoch, epoch_train_loss, val_loss)
         if val_loss < best - 1e-8:
             best, best_state, stale, best_epoch = val_loss, {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}, 0, epoch
         else:
@@ -198,7 +209,59 @@ def health():
     return {"status": "ok", "model": "LSTM", "window_hours": WINDOW}
 
 
-@app.post("/forecast")
+def run_forecast_job(job_id: str, key: str, raw: bytes, filename: str, horizon: int):
+    try:
+        with jobs_lock:
+            job = forecast_jobs[job_id]
+            job["status"] = "preparing"
+            job["message"] = "Reading the CSV and preparing hourly features."
+
+        cached = trained_cache.get(key)
+        if cached is None:
+            history, source = parse_csv(raw)
+            features = make_features(history)
+
+            def report_epoch(epoch, train_loss, val_loss):
+                with jobs_lock:
+                    current = forecast_jobs.get(job_id)
+                    if current:
+                        current.update({
+                            "status": "training",
+                            "epoch": epoch,
+                            "total_epochs": 250,
+                            "train_loss": train_loss,
+                            "validation_loss": val_loss,
+                            "message": f"Training the LSTM · epoch {epoch} of up to 250",
+                        })
+
+            model, x_scaler, y_scaler, valid, metrics = fit_model(features, on_epoch=report_epoch)
+            trained_cache.clear()
+            trained_cache[key] = (history, model, x_scaler, y_scaler, valid, metrics, source)
+        else:
+            history, model, x_scaler, y_scaler, valid, metrics, source = cached
+
+        future = forecast(model, x_scaler, y_scaler, history, valid, horizon)
+        observed = [{"datetime": row.datetime.isoformat(), "value": float(row.Production)} for row in history.tail(WINDOW).itertuples()]
+        result = {"observed": observed, "forecast": future, "metrics": metrics,
+                  "source": source, "filename": filename, "rows_used": len(history),
+                  "trained_through": history.datetime.iloc[-1].isoformat()}
+        with jobs_lock:
+            forecast_jobs[job_id].update({"status": "completed", "message": "Forecast ready.", "result": result})
+    except HTTPException as exc:
+        with jobs_lock:
+            forecast_jobs[job_id].update({"status": "failed", "error": str(exc.detail)})
+    except Exception as exc:
+        logging.exception("Forecast job %s failed", job_id)
+        with jobs_lock:
+            forecast_jobs[job_id].update({"status": "failed", "error": "The forecast could not be completed. Check the backend logs and try again."})
+    finally:
+        with jobs_lock:
+            for active_key, active_id in list(active_jobs.items()):
+                if active_id == job_id:
+                    active_jobs.pop(active_key, None)
+
+
+@app.post("/forecast", status_code=202)
 async def create_forecast(file: UploadFile = File(...), horizon: int = Form(24)):
     if horizon < 1 or horizon > 168:
         raise HTTPException(400, "Forecast horizon must be between 1 and 168 hours.")
@@ -208,17 +271,23 @@ async def create_forecast(file: UploadFile = File(...), horizon: int = Form(24))
     if len(raw) > 25 * 1024 * 1024:
         raise HTTPException(413, "CSV upload is limited to 25 MB.")
     key = hashlib.sha256(raw).hexdigest()
-    cached = trained_cache.get(key)
-    source = "All sources"
-    if cached is None:
-        history, source = parse_csv(raw)
-        features = make_features(history)
-        model, x_scaler, y_scaler, valid, metrics = fit_model(features)
-        trained_cache.clear()
-        trained_cache[key] = (history, model, x_scaler, y_scaler, valid, metrics, source)
-    else:
-        history, model, x_scaler, y_scaler, valid, metrics, source = cached
-    future = forecast(model, x_scaler, y_scaler, history, valid, horizon)
-    observed = [{"datetime": row.datetime.isoformat(), "value": float(row.Production)} for row in history.tail(WINDOW).itertuples()]
-    return {"observed": observed, "forecast": future, "metrics": metrics,
-            "source": source, "filename": file.filename, "rows_used": len(history), "trained_through": history.datetime.iloc[-1].isoformat()}
+    job_key = f"{key}:{horizon}"
+    with jobs_lock:
+        existing = active_jobs.get(job_key)
+        if existing:
+            return {"job_id": existing, "status": forecast_jobs[existing]["status"]}
+        job_id = str(uuid.uuid4())
+        forecast_jobs[job_id] = {"status": "queued", "message": "Forecast queued.", "epoch": 0, "total_epochs": 250}
+        active_jobs[job_key] = job_id
+    job_executor.submit(run_forecast_job, job_id, key, raw, file.filename, horizon)
+    return {"job_id": job_id, "status": "queued", "message": "Forecast queued."}
+
+
+@app.get("/forecast/{job_id}")
+def get_forecast_job(job_id: str):
+    with jobs_lock:
+        job = forecast_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(404, "This forecast job is no longer available. Please upload the CSV and try again.")
+        return dict(job)
+

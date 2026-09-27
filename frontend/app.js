@@ -26,16 +26,32 @@ form.addEventListener("submit", async (event) => {
   button.disabled = true;
   $("error-message").classList.add("hidden");
   $("status-banner").classList.remove("hidden");
-  $("status-message").textContent = "Training your LSTM and preparing the forecast…";
+  $("status-message").textContent = "Uploading your data and starting the forecast…";
   try {
     const base = (window.CURRENT_API_URL || "http://localhost:8000").replace(/\/$/, "");
     const response = await fetch(`${base}/forecast`, { method: "POST", body: data });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.detail || result.error || `Request failed (${response.status})`);
+    const started = await response.json();
+    if (!response.ok) throw new Error(started.detail || started.error || `Request failed (${response.status})`);
+    let result;
+    while (!result) {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      const statusResponse = await fetch(`${base}/forecast/${encodeURIComponent(started.job_id)}`);
+      const status = await statusResponse.json();
+      if (!statusResponse.ok) throw new Error(status.detail || status.error || `Status request failed (${statusResponse.status})`);
+      if (status.status === "failed") throw new Error(status.error || "The forecast could not be completed.");
+      if (status.status === "completed") {
+        result = status.result;
+      } else if (status.status === "training") {
+        const loss = Number.isFinite(status.validation_loss) ? ` · validation loss ${status.validation_loss.toFixed(5)}` : "";
+        $("status-message").textContent = `Training your LSTM · epoch ${status.epoch} of up to ${status.total_epochs}${loss}`;
+      } else {
+        $("status-message").textContent = status.message || "Preparing your forecast…";
+      }
+    }
     showResults(result);
   } catch (error) {
     console.error("Forecast request failed:", error);
-    $("error-message").textContent = `Forecast failed: ${error.message}. Check that the API is running and your CSV columns are named Date and Hour and Production.`;
+    $("error-message").textContent = `Forecast failed: ${error.message}`;
     $("error-message").classList.remove("hidden");
   } finally {
     button.disabled = false;
@@ -90,3 +106,4 @@ $("download-csv").addEventListener("click", () => {
   const csv = rows.map((row) => row.map((value) => `"${String(value).replaceAll('"', '""')}"`).join(",")).join("\n");
   const link = document.createElement("a"); link.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" })); link.download = "renewables-forecast.csv"; link.click(); URL.revokeObjectURL(link.href);
 });
+
