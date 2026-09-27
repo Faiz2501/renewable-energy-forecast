@@ -34,7 +34,6 @@ form.addEventListener("submit", async (event) => {
     if (!response.ok) throw new Error(started.detail || started.error || `Request failed (${response.status})`);
     let result;
     while (!result) {
-      await new Promise((resolve) => setTimeout(resolve, 3000));
       const statusResponse = await fetch(`${base}/forecast/${encodeURIComponent(started.job_id)}`);
       const status = await statusResponse.json();
       if (!statusResponse.ok) throw new Error(status.detail || status.error || `Status request failed (${statusResponse.status})`);
@@ -47,6 +46,7 @@ form.addEventListener("submit", async (event) => {
       } else {
         $("status-message").textContent = status.message || "Preparing your forecast…";
       }
+      if (!result) await new Promise((resolve) => setTimeout(resolve, 3000));
     }
     showResults(result);
   } catch (error) {

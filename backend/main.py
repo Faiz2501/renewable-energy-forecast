@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import hashlib
+import json
 import math
 import os
 import logging
@@ -9,6 +10,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -51,13 +53,46 @@ class LSTMForecast(nn.Module):
 
 class WindowDataset(Dataset):
     def __init__(self, x: np.ndarray, y: np.ndarray):
-        self.x, self.y = x, y
+        windows = np.lib.stride_tricks.sliding_window_view(x, WINDOW, axis=0)[:-1]
+        self.x = torch.from_numpy(np.ascontiguousarray(np.moveaxis(windows, -1, 1), dtype=np.float32))
+        self.y = torch.from_numpy(np.asarray(y[WINDOW:], dtype=np.float32))
 
     def __len__(self) -> int:
-        return max(0, len(self.x) - WINDOW)
+        return len(self.y)
 
     def __getitem__(self, index: int):
-        return torch.tensor(self.x[index:index + WINDOW], dtype=torch.float32), torch.tensor(self.y[index + WINDOW], dtype=torch.float32)
+        return self.x[index], self.y[index]
+
+
+ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts"
+PRETRAINED_MODEL_PATH = ARTIFACT_DIR / "france-wind-lstm.pt"
+PRETRAINED_RESULTS_PATH = ARTIFACT_DIR / "france-wind-results.json"
+pretrained_artifact = None
+pretrained_model = None
+
+
+def load_pretrained_artifact():
+    global pretrained_artifact, pretrained_model
+    if not PRETRAINED_MODEL_PATH.is_file() or not PRETRAINED_RESULTS_PATH.is_file():
+        return
+    try:
+        with PRETRAINED_RESULTS_PATH.open("r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+        model = LSTMForecast().to(DEVICE)
+        checkpoint = torch.load(PRETRAINED_MODEL_PATH, map_location=DEVICE, weights_only=True)
+        if checkpoint.get("window") != WINDOW or checkpoint.get("features") != FEATURES:
+            raise ValueError("The saved France model uses an incompatible feature layout.")
+        model.load_state_dict(checkpoint["state_dict"])
+        model.eval()
+        if not metadata.get("dataset_sha256") or not metadata.get("forecast") or not metadata.get("metrics"):
+            raise ValueError("The saved France forecast artifact is incomplete.")
+        pretrained_artifact, pretrained_model = metadata, model
+        logging.info("Loaded saved France wind model and forecast for dataset %s", metadata["dataset_sha256"])
+    except Exception:
+        logging.exception("Could not load the saved France wind forecast artifact")
+
+
+load_pretrained_artifact()
 
 
 def make_features(frame: pd.DataFrame) -> pd.DataFrame:
@@ -200,7 +235,7 @@ def forecast(model, x_scaler, y_scaler, history: pd.DataFrame, valid: pd.DataFra
             "lag_1": recent[-1], "lag_24": recent[-24], "lag_168": recent[-168],
             "roll_24_mean": recent[-24:].mean(), "roll_24_std": recent[-24:].std(ddof=1),
         }], columns=FEATURES)
-        scaled = np.vstack([scaled[1:], x_scaler.transform(row)])
+        scaled = np.vstack([scaled[1:], x_scaler.transform(row[FEATURES].to_numpy())])
     return result
 
 
@@ -215,6 +250,20 @@ def run_forecast_job(job_id: str, key: str, raw: bytes, filename: str, horizon: 
             job = forecast_jobs[job_id]
             job["status"] = "preparing"
             job["message"] = "Reading the CSV and preparing hourly features."
+
+        if pretrained_artifact and key == pretrained_artifact["dataset_sha256"]:
+            result = {
+                "observed": pretrained_artifact["observed"],
+                "forecast": pretrained_artifact["forecast"][:horizon],
+                "metrics": pretrained_artifact["metrics"],
+                "source": pretrained_artifact["source"],
+                "filename": filename,
+                "rows_used": pretrained_artifact["rows_used"],
+                "trained_through": pretrained_artifact["trained_through"],
+            }
+            with jobs_lock:
+                forecast_jobs[job_id].update({"status": "completed", "message": "Saved forecast ready.", "result": result})
+            return
 
         cached = trained_cache.get(key)
         if cached is None:

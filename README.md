@@ -33,7 +33,9 @@ Serve the `frontend` directory with any static web server. The API health check 
 
 The API builds cyclical hour and day-of-year features, recent and weekly lags, and rolling 24-hour statistics. It uses a two-layer, 128-unit LSTM with a 24-hour input window and a chronological 70/20/10 train, validation, and test split. MAE, RMSE, MSE, and R² are calculated on the held-out test segment in the original production units. The selected model then projects forward one hour at a time.
 
-The first forecast for a new CSV trains the model and can take a long time on a CPU. The page displays the current epoch and validation loss while training runs. The fitted model is cached in memory for later forecasts using the same CSV while the API process stays running. Uploaded CSV files are not saved by the API. A restart clears active jobs and the in-memory cache.
+The included France wind checkpoint and precomputed metrics/forecast are served immediately when a user uploads the exact same CSV file. The CSV itself is not included. For any other CSV, the first forecast trains the model as a background job; the page displays the current epoch and validation loss. That fitted model is cached in memory for the same file while the API process stays running. A restart clears active jobs and this in-memory cache, but the bundled France artifact remains available.
+
+To rebuild the shared France artifact from the source CSV, run `python build_france_artifact.py <path-to-csv>` from `backend`. This writes a model checkpoint and result metadata under `backend/artifacts/`; the uploaded CSV remains local.
 
 ## Deployment
 
