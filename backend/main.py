@@ -6,6 +6,7 @@ import json
 import math
 import os
 import logging
+import base64
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -73,13 +74,21 @@ pretrained_model = None
 
 def load_pretrained_artifact():
     global pretrained_artifact, pretrained_model
-    if not PRETRAINED_MODEL_PATH.is_file() or not PRETRAINED_RESULTS_PATH.is_file():
+    if not PRETRAINED_RESULTS_PATH.is_file():
         return
     try:
         with PRETRAINED_RESULTS_PATH.open("r", encoding="utf-8") as handle:
             metadata = json.load(handle)
         model = LSTMForecast().to(DEVICE)
-        checkpoint = torch.load(PRETRAINED_MODEL_PATH, map_location=DEVICE, weights_only=True)
+        checkpoint_parts = sorted(ARTIFACT_DIR.glob("france-wind-lstm-*.b64"))
+        if checkpoint_parts:
+            encoded_checkpoint = "".join(part.read_text(encoding="ascii").strip() for part in checkpoint_parts)
+            checkpoint_bytes = base64.b64decode(encoded_checkpoint, validate=True)
+        elif PRETRAINED_MODEL_PATH.is_file():
+            checkpoint_bytes = PRETRAINED_MODEL_PATH.read_bytes()
+        else:
+            raise FileNotFoundError("The saved France model checkpoint is missing.")
+        checkpoint = torch.load(io.BytesIO(checkpoint_bytes), map_location=DEVICE, weights_only=True)
         if checkpoint.get("window") != WINDOW or checkpoint.get("features") != FEATURES:
             raise ValueError("The saved France model uses an incompatible feature layout.")
         model.load_state_dict(checkpoint["state_dict"])
